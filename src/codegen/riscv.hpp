@@ -2,6 +2,7 @@
 #include "ast/ast.hpp"
 #include "common/types.hpp"
 #include "ir/ir.hpp"
+#include "ir/reg_alloc.hpp"
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,19 +28,21 @@ private:
     // 作用域管理
     std::stack<std::unordered_map<std::string, int>> scopeStack;
 
+    // 寄存器分配结果
+    std::unordered_map<int, RegAlloc::Allocation> regAlloc;
+
     // IR 代码生成
-    std::unordered_map<int, int> vregSlots;    // vreg → 栈偏移
+    std::unordered_map<int, int> vregSlots;    // vreg → 栈偏移 (spilled only)
     std::unordered_map<int, std::string> irLabels; // IR label id → asm label
     int vregSlotOffset = 0;
-    int paramIdx = 0; // 函数调用参数计数器
+    int paramIdx = 0;
 
     void generateFunctionFromIR(const IRFunction& irFunc);
     void emitIRInstruction(const IRInstr& instr);
 
-    // 加载/存储 vreg
-    void loadVRegToT0(int vreg);
-    void loadVRegToT1(int vreg);
-    void storeT0ToVReg(int vreg);
+    // 寄存器感知的加载/存储
+    std::string getSrcReg(int vreg);
+    void storeResult(int vreg, const std::string& reg);
     std::string getAsmLabel(int irLabelId);
 
 public:

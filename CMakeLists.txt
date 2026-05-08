@@ -30,6 +30,7 @@ set(SOURCES
     src/semantic/analyzer.cpp
     src/codegen/riscv.cpp
     src/ir/ir_builder.cpp
+    src/ir/reg_alloc.cpp
     src/utils/utils.cpp
     ${FLEX_ToyC_Lexer_OUTPUTS}
     ${BISON_ToyC_Parser_OUTPUTS}

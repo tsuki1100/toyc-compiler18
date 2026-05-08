@@ -31,16 +31,18 @@ std::string RISCVCodeGenerator::generate(CompilationUnit& unit,
 void RISCVCodeGenerator::generateFunctionFromIR(const IRFunction& irFunc) {
     vregSlots.clear();
     irLabels.clear();
-    vregSlotOffset = -20; // 从 -20 开始，为 ra/fp 预留
+    vregSlotOffset = -20;
+    paramIdx = 0;
 
-    // 分配 vreg 栈槽
-    for (const auto& instr : irFunc.instructions) {
-        int vreg = instr.dest.value;
-        if (instr.dest.kind == IROperand::VREG && vreg >= 0) {
-            if (vregSlots.find(vreg) == vregSlots.end()) {
-                vregSlots[vreg] = vregSlotOffset;
-                vregSlotOffset -= 4;
-            }
+    // 运行寄存器分配
+    RegAlloc ra;
+    regAlloc = ra.allocate(irFunc);
+
+    // 为溢出 vreg 分配栈槽
+    for (auto& [vreg, alloc] : regAlloc) {
+        if (alloc.kind == RegAlloc::Allocation::SPILL) {
+            vregSlots[vreg] = vregSlotOffset;
+            vregSlotOffset -= 4;
         }
     }
 
@@ -63,104 +65,169 @@ void RISCVCodeGenerator::generateFunctionFromIR(const IRFunction& irFunc) {
     int totalFrame = (-vregSlotOffset + 16 + 15) & ~15;
     generatePrologue(irFunc.name, totalFrame);
 
-    // 参数: 将 a0-a7 存入其栈槽 (前8个参数)
     for (int i = 0; i < irFunc.paramCount && i < 8; i++) {
-        // 参数的栈偏移已由 IRBuilder 分配
         int paramOffset = -20 - i * 4;
         emit("sw a" + std::to_string(i) + ", " + std::to_string(paramOffset) + "(fp)");
     }
 
-    // 生成指令
     for (const auto& instr : irFunc.instructions) {
         emitIRInstruction(instr);
+    }
+
+    regAlloc.clear();
+}
+
+// 获取 vreg 所在的寄存器名 (若在寄存器中) 或加载到 t0 返回 "t0"
+std::string RISCVCodeGenerator::getSrcReg(int vreg) {
+    auto it = regAlloc.find(vreg);
+    if (it != regAlloc.end() && it->second.kind == RegAlloc::Allocation::REG) {
+        return RegAlloc::REG_NAMES[it->second.physReg];
+    }
+    // spilled 或未分配: 加载到 t0
+    auto slot = vregSlots.find(vreg);
+    if (slot != vregSlots.end()) {
+        emit("lw t0, " + std::to_string(slot->second) + "(fp)");
+    }
+    return "t0";
+}
+
+// 将结果写回 (若在寄存器中，值已在那里; 若 spilled，存到栈)
+void RISCVCodeGenerator::storeResult(int vreg, const std::string& reg) {
+    auto it = regAlloc.find(vreg);
+    if (it != regAlloc.end() && it->second.kind == RegAlloc::Allocation::REG) {
+        if (RegAlloc::REG_NAMES[it->second.physReg] != reg) {
+            emit("mv " + std::string(RegAlloc::REG_NAMES[it->second.physReg]) + ", " + reg);
+        }
+        return;
+    }
+    auto slot = vregSlots.find(vreg);
+    if (slot != vregSlots.end()) {
+        emit("sw " + reg + ", " + std::to_string(slot->second) + "(fp)");
     }
 }
 
 void RISCVCodeGenerator::emitIRInstruction(const IRInstr& instr) {
     switch (instr.op) {
 
-    case IROp::LI:
-        emit("li t0, " + std::to_string(instr.src1.value));
-        emit("sw t0, " + std::to_string(vregSlots[instr.dest.value]) + "(fp)");
+    case IROp::LI: {
+        auto it = regAlloc.find(instr.dest.value);
+        if (it != regAlloc.end() && it->second.kind == RegAlloc::Allocation::REG) {
+            emit("li " + std::string(RegAlloc::REG_NAMES[it->second.physReg]) +
+                 ", " + std::to_string(instr.src1.value));
+        } else {
+            emit("li t0, " + std::to_string(instr.src1.value));
+            storeResult(instr.dest.value, "t0");
+        }
         break;
+    }
 
-    case IROp::MOVE:
-        loadVRegToT0(instr.src1.value);
-        storeT0ToVReg(instr.dest.value);
+    case IROp::MOVE: {
+        std::string s = getSrcReg(instr.src1.value);
+        storeResult(instr.dest.value, s);
         break;
+    }
 
     case IROp::ADD: case IROp::SUB: case IROp::MUL:
     case IROp::DIV: case IROp::MOD:
     case IROp::AND: case IROp::OR:
     case IROp::LT:  case IROp::LE:  case IROp::GT:
     case IROp::GE:  case IROp::EQ:  case IROp::NE: {
-        loadVRegToT0(instr.src1.value);
-        loadVRegToT1(instr.src2.value);
+        std::string rs1 = getSrcReg(instr.src1.value);
+        std::string rs2 = getSrcReg(instr.src2.value);
+
+        // 确定目标寄存器
+        std::string rd = "t0";
+        auto it = regAlloc.find(instr.dest.value);
+        bool destInReg = (it != regAlloc.end() && it->second.kind == RegAlloc::Allocation::REG);
+        if (destInReg) {
+            rd = RegAlloc::REG_NAMES[it->second.physReg];
+            // 如果 rs1 或 rs2 恰好是 t0，需要复制到目标寄存器后再操作
+            if (rs2 == rd) {
+                emit("mv t1, " + rs2);
+                rs2 = "t1";
+            }
+            if (rs1 == "t0" && rd != "t0") {
+                emit("mv " + rd + ", t0");
+                rs1 = rd;
+            }
+        }
+
         switch (instr.op) {
-            case IROp::ADD: emit("add t0, t0, t1"); break;
-            case IROp::SUB: emit("sub t0, t0, t1"); break;
-            case IROp::MUL: emit("mul t0, t0, t1"); break;
-            case IROp::DIV: emit("div t0, t0, t1"); break;
-            case IROp::MOD: emit("rem t0, t0, t1"); break;
-            case IROp::AND: emit("and t0, t0, t1"); break;
-            case IROp::OR:  emit("or t0, t0, t1");  break;
-            case IROp::LT:  emit("slt t0, t0, t1"); break;
+            case IROp::ADD: emit("add " + rd + ", " + rs1 + ", " + rs2); break;
+            case IROp::SUB: emit("sub " + rd + ", " + rs1 + ", " + rs2); break;
+            case IROp::MUL: emit("mul " + rd + ", " + rs1 + ", " + rs2); break;
+            case IROp::DIV: emit("div " + rd + ", " + rs1 + ", " + rs2); break;
+            case IROp::MOD: emit("rem " + rd + ", " + rs1 + ", " + rs2); break;
+            case IROp::AND: emit("and " + rd + ", " + rs1 + ", " + rs2); break;
+            case IROp::OR:  emit("or "  + rd + ", " + rs1 + ", " + rs2); break;
+            case IROp::LT:  emit("slt " + rd + ", " + rs1 + ", " + rs2); break;
             case IROp::LE:
-                emit("slt t2, t1, t0");
-                emit("xori t0, t2, 1");
+                emit("slt t1, " + rs2 + ", " + rs1);
+                emit("xori " + rd + ", t1, 1");
                 break;
-            case IROp::GT:  emit("slt t0, t1, t0"); break;
+            case IROp::GT:  emit("slt " + rd + ", " + rs2 + ", " + rs1); break;
             case IROp::GE:
-                emit("slt t2, t0, t1");
-                emit("xori t0, t2, 1");
+                emit("slt t1, " + rs1 + ", " + rs2);
+                emit("xori " + rd + ", t1, 1");
                 break;
             case IROp::EQ:
-                emit("sub t0, t0, t1");
-                emit("seqz t0, t0");
+                emit("sub " + rd + ", " + rs1 + ", " + rs2);
+                emit("seqz " + rd + ", " + rd);
                 break;
             case IROp::NE:
-                emit("sub t0, t0, t1");
-                emit("snez t0, t0");
+                emit("sub " + rd + ", " + rs1 + ", " + rs2);
+                emit("snez " + rd + ", " + rd);
                 break;
             default: break;
         }
-        storeT0ToVReg(instr.dest.value);
+        if (!destInReg) {
+            storeResult(instr.dest.value, rd);
+        }
         break;
     }
 
-    case IROp::NEG:
-        loadVRegToT0(instr.src1.value);
-        emit("neg t0, t0");
-        storeT0ToVReg(instr.dest.value);
+    case IROp::NEG: {
+        std::string s = getSrcReg(instr.src1.value);
+        emit("neg t0, " + s);
+        storeResult(instr.dest.value, "t0");
         break;
+    }
 
-    case IROp::NOT:
-        loadVRegToT0(instr.src1.value);
-        emit("seqz t0, t0");
-        storeT0ToVReg(instr.dest.value);
+    case IROp::NOT: {
+        std::string s = getSrcReg(instr.src1.value);
+        emit("seqz t0, " + s);
+        storeResult(instr.dest.value, "t0");
         break;
+    }
 
-    case IROp::LOAD:
-        if (instr.src1.kind == IROperand::IMM) {
-            // 局部变量加载
-            emit("lw t0, " + std::to_string(instr.src1.value) + "(fp)");
-        } else {
-            // 全局变量
-            emit("auipc t0, %pcrel_hi(" + instr.src1.name + ")");
-            emit("lw t0, %pcrel_lo(" + instr.src1.name + ")(t0)");
+    case IROp::LOAD: {
+        auto it = regAlloc.find(instr.dest.value);
+        std::string destReg = "t0";
+        if (it != regAlloc.end() && it->second.kind == RegAlloc::Allocation::REG) {
+            destReg = RegAlloc::REG_NAMES[it->second.physReg];
         }
-        storeT0ToVReg(instr.dest.value);
+        if (instr.src1.kind == IROperand::IMM) {
+            emit("lw " + destReg + ", " + std::to_string(instr.src1.value) + "(fp)");
+        } else {
+            emit("auipc " + destReg + ", %pcrel_hi(" + instr.src1.name + ")");
+            emit("lw " + destReg + ", %pcrel_lo(" + instr.src1.name + ")(" + destReg + ")");
+        }
+        if (destReg == "t0") {
+            storeResult(instr.dest.value, "t0");
+        }
         break;
+    }
 
-    case IROp::STORE:
-        loadVRegToT0(instr.src1.value);
+    case IROp::STORE: {
+        std::string s = getSrcReg(instr.src1.value);
         if (instr.src2.kind == IROperand::IMM) {
-            emit("sw t0, " + std::to_string(instr.src2.value) + "(fp)");
+            emit("sw " + s + ", " + std::to_string(instr.src2.value) + "(fp)");
         } else {
             emit("auipc t1, %pcrel_hi(" + instr.src2.name + ")");
-            emit("sw t0, %pcrel_lo(" + instr.src2.name + ")(t1)");
+            emit("sw " + s + ", %pcrel_lo(" + instr.src2.name + ")(t1)");
         }
         break;
+    }
 
     case IROp::LABEL:
         emitLabel(getAsmLabel(instr.src1.value));
@@ -170,30 +237,29 @@ void RISCVCodeGenerator::emitIRInstruction(const IRInstr& instr) {
         emit("j " + getAsmLabel(instr.src1.value));
         break;
 
-    case IROp::BR:
-        // BR cond, elseLabel — 条件为0跳转到 else, 否则继续(then)
-        loadVRegToT0(instr.src1.value);  // 条件 vreg
-        emit("beqz t0, " + getAsmLabel(instr.src2.value));
+    case IROp::BR: {
+        std::string cond = getSrcReg(instr.src1.value);
+        emit("beqz " + cond + ", " + getAsmLabel(instr.src2.value));
         break;
+    }
 
-    case IROp::PARAM:
-        loadVRegToT0(instr.src1.value);
+    case IROp::PARAM: {
+        std::string s = getSrcReg(instr.src1.value);
         if (paramIdx < 8) {
-            emit("mv a" + std::to_string(paramIdx) + ", t0");
+            emit("mv a" + std::to_string(paramIdx) + ", " + s);
         } else {
             emit("addi sp, sp, -4");
-            emit("sw t0, 0(sp)");
+            emit("sw " + s + ", 0(sp)");
         }
         paramIdx++;
         break;
+    }
 
     case IROp::CALL:
         emit("call " + instr.src1.name);
-        // 保存返回值
         if (instr.dest.kind == IROperand::VREG) {
-            emit("sw a0, " + std::to_string(vregSlots[instr.dest.value]) + "(fp)");
+            storeResult(instr.dest.value, "a0");
         }
-        // 清理栈参数 (超过8个的)
         {
             int extraParams = instr.src2.value - 8;
             if (extraParams > 0) {
@@ -205,36 +271,11 @@ void RISCVCodeGenerator::emitIRInstruction(const IRInstr& instr) {
 
     case IROp::RET:
         if (instr.src1.kind == IROperand::VREG && instr.src1.value >= 0) {
-            loadVRegToT0(instr.src1.value);
-            emit("mv a0, t0");
+            std::string s = getSrcReg(instr.src1.value);
+            emit("mv a0, " + s);
         }
         generateEpilogue();
         break;
-    }
-}
-
-void RISCVCodeGenerator::loadVRegToT0(int vreg) {
-    auto it = vregSlots.find(vreg);
-    if (it != vregSlots.end()) {
-        emit("lw t0, " + std::to_string(it->second) + "(fp)");
-    } else {
-        emit("# ERROR: vreg " + std::to_string(vreg) + " not allocated");
-    }
-}
-
-void RISCVCodeGenerator::loadVRegToT1(int vreg) {
-    auto it = vregSlots.find(vreg);
-    if (it != vregSlots.end()) {
-        emit("lw t1, " + std::to_string(it->second) + "(fp)");
-    } else {
-        emit("# ERROR: vreg " + std::to_string(vreg) + " not allocated");
-    }
-}
-
-void RISCVCodeGenerator::storeT0ToVReg(int vreg) {
-    auto it = vregSlots.find(vreg);
-    if (it != vregSlots.end()) {
-        emit("sw t0, " + std::to_string(it->second) + "(fp)");
     }
 }
 
