@@ -1,8 +1,250 @@
 #include "codegen/riscv.hpp"
+#include "ir/ir_builder.hpp"
 #include <iostream>
 #include <sstream>
 
-// 在RISCVCodeGenerator类中添加这些方法
+// ============================
+// IR → 汇编 代码生成
+// ============================
+
+std::string RISCVCodeGenerator::generate(CompilationUnit& unit,
+                                          const std::unordered_map<std::string, FunctionInfo>& funcTable) {
+    // Step 1: AST → IR
+    IRBuilder irBuilder(optimizationsEnabled);
+    auto irFunctions = irBuilder.build(unit);
+
+    // Step 2: IR → RISC-V 汇编
+    functions = funcTable;
+    output.clear();
+    labelCounter = 0;
+
+    emit(".text");
+    emit(".global main");
+
+    for (const auto& irFunc : irFunctions) {
+        generateFunctionFromIR(irFunc);
+    }
+
+    return output;
+}
+
+void RISCVCodeGenerator::generateFunctionFromIR(const IRFunction& irFunc) {
+    vregSlots.clear();
+    irLabels.clear();
+    vregSlotOffset = -20; // 从 -20 开始，为 ra/fp 预留
+
+    // 分配 vreg 栈槽
+    for (const auto& instr : irFunc.instructions) {
+        int vreg = instr.dest.value;
+        if (instr.dest.kind == IROperand::VREG && vreg >= 0) {
+            if (vregSlots.find(vreg) == vregSlots.end()) {
+                vregSlots[vreg] = vregSlotOffset;
+                vregSlotOffset -= 4;
+            }
+        }
+    }
+
+    // 分配 IR 标签 → 汇编标签
+    for (const auto& instr : irFunc.instructions) {
+        if (instr.op == IROp::LABEL) {
+            int id = instr.src1.value;
+            if (irLabels.find(id) == irLabels.end()) {
+                irLabels[id] = newLabel("L");
+            }
+        }
+        if (instr.op == IROp::BR) {
+            int l1 = instr.src1.value;
+            int l2 = instr.src2.value;
+            if (irLabels.find(l1) == irLabels.end()) irLabels[l1] = newLabel("L");
+            if (irLabels.find(l2) == irLabels.end()) irLabels[l2] = newLabel("L");
+        }
+    }
+
+    int totalFrame = (-vregSlotOffset + 16 + 15) & ~15;
+    generatePrologue(irFunc.name, totalFrame);
+
+    // 参数: 将 a0-a7 存入其栈槽 (前8个参数)
+    for (int i = 0; i < irFunc.paramCount && i < 8; i++) {
+        // 参数的栈偏移已由 IRBuilder 分配
+        int paramOffset = -20 - i * 4;
+        emit("sw a" + std::to_string(i) + ", " + std::to_string(paramOffset) + "(fp)");
+    }
+
+    // 生成指令
+    for (const auto& instr : irFunc.instructions) {
+        emitIRInstruction(instr);
+    }
+}
+
+void RISCVCodeGenerator::emitIRInstruction(const IRInstr& instr) {
+    switch (instr.op) {
+
+    case IROp::LI:
+        emit("li t0, " + std::to_string(instr.src1.value));
+        emit("sw t0, " + std::to_string(vregSlots[instr.dest.value]) + "(fp)");
+        break;
+
+    case IROp::MOVE:
+        loadVRegToT0(instr.src1.value);
+        storeT0ToVReg(instr.dest.value);
+        break;
+
+    case IROp::ADD: case IROp::SUB: case IROp::MUL:
+    case IROp::DIV: case IROp::MOD:
+    case IROp::AND: case IROp::OR:
+    case IROp::LT:  case IROp::LE:  case IROp::GT:
+    case IROp::GE:  case IROp::EQ:  case IROp::NE: {
+        loadVRegToT0(instr.src1.value);
+        loadVRegToT1(instr.src2.value);
+        switch (instr.op) {
+            case IROp::ADD: emit("add t0, t0, t1"); break;
+            case IROp::SUB: emit("sub t0, t0, t1"); break;
+            case IROp::MUL: emit("mul t0, t0, t1"); break;
+            case IROp::DIV: emit("div t0, t0, t1"); break;
+            case IROp::MOD: emit("rem t0, t0, t1"); break;
+            case IROp::AND: emit("and t0, t0, t1"); break;
+            case IROp::OR:  emit("or t0, t0, t1");  break;
+            case IROp::LT:  emit("slt t0, t0, t1"); break;
+            case IROp::LE:
+                emit("slt t2, t1, t0");
+                emit("xori t0, t2, 1");
+                break;
+            case IROp::GT:  emit("slt t0, t1, t0"); break;
+            case IROp::GE:
+                emit("slt t2, t0, t1");
+                emit("xori t0, t2, 1");
+                break;
+            case IROp::EQ:
+                emit("sub t0, t0, t1");
+                emit("seqz t0, t0");
+                break;
+            case IROp::NE:
+                emit("sub t0, t0, t1");
+                emit("snez t0, t0");
+                break;
+            default: break;
+        }
+        storeT0ToVReg(instr.dest.value);
+        break;
+    }
+
+    case IROp::NEG:
+        loadVRegToT0(instr.src1.value);
+        emit("neg t0, t0");
+        storeT0ToVReg(instr.dest.value);
+        break;
+
+    case IROp::NOT:
+        loadVRegToT0(instr.src1.value);
+        emit("seqz t0, t0");
+        storeT0ToVReg(instr.dest.value);
+        break;
+
+    case IROp::LOAD:
+        if (instr.src1.kind == IROperand::IMM) {
+            // 局部变量加载
+            emit("lw t0, " + std::to_string(instr.src1.value) + "(fp)");
+        } else {
+            // 全局变量
+            emit("auipc t0, %pcrel_hi(" + instr.src1.name + ")");
+            emit("lw t0, %pcrel_lo(" + instr.src1.name + ")(t0)");
+        }
+        storeT0ToVReg(instr.dest.value);
+        break;
+
+    case IROp::STORE:
+        loadVRegToT0(instr.src1.value);
+        if (instr.src2.kind == IROperand::IMM) {
+            emit("sw t0, " + std::to_string(instr.src2.value) + "(fp)");
+        } else {
+            emit("auipc t1, %pcrel_hi(" + instr.src2.name + ")");
+            emit("sw t0, %pcrel_lo(" + instr.src2.name + ")(t1)");
+        }
+        break;
+
+    case IROp::LABEL:
+        emitLabel(getAsmLabel(instr.src1.value));
+        break;
+
+    case IROp::JUMP:
+        emit("j " + getAsmLabel(instr.src1.value));
+        break;
+
+    case IROp::BR:
+        // BR cond, elseLabel — 条件为0跳转到 else, 否则继续(then)
+        loadVRegToT0(instr.src1.value);  // 条件 vreg
+        emit("beqz t0, " + getAsmLabel(instr.src2.value));
+        break;
+
+    case IROp::PARAM:
+        loadVRegToT0(instr.src1.value);
+        if (paramIdx < 8) {
+            emit("mv a" + std::to_string(paramIdx) + ", t0");
+        } else {
+            emit("addi sp, sp, -4");
+            emit("sw t0, 0(sp)");
+        }
+        paramIdx++;
+        break;
+
+    case IROp::CALL:
+        emit("call " + instr.src1.name);
+        // 保存返回值
+        if (instr.dest.kind == IROperand::VREG) {
+            emit("sw a0, " + std::to_string(vregSlots[instr.dest.value]) + "(fp)");
+        }
+        // 清理栈参数 (超过8个的)
+        {
+            int extraParams = instr.src2.value - 8;
+            if (extraParams > 0) {
+                emit("addi sp, sp, " + std::to_string(extraParams * 4));
+            }
+        }
+        paramIdx = 0;
+        break;
+
+    case IROp::RET:
+        if (instr.src1.kind == IROperand::VREG && instr.src1.value >= 0) {
+            loadVRegToT0(instr.src1.value);
+            emit("mv a0, t0");
+        }
+        generateEpilogue();
+        break;
+    }
+}
+
+void RISCVCodeGenerator::loadVRegToT0(int vreg) {
+    auto it = vregSlots.find(vreg);
+    if (it != vregSlots.end()) {
+        emit("lw t0, " + std::to_string(it->second) + "(fp)");
+    } else {
+        emit("# ERROR: vreg " + std::to_string(vreg) + " not allocated");
+    }
+}
+
+void RISCVCodeGenerator::loadVRegToT1(int vreg) {
+    auto it = vregSlots.find(vreg);
+    if (it != vregSlots.end()) {
+        emit("lw t1, " + std::to_string(it->second) + "(fp)");
+    } else {
+        emit("# ERROR: vreg " + std::to_string(vreg) + " not allocated");
+    }
+}
+
+void RISCVCodeGenerator::storeT0ToVReg(int vreg) {
+    auto it = vregSlots.find(vreg);
+    if (it != vregSlots.end()) {
+        emit("sw t0, " + std::to_string(it->second) + "(fp)");
+    }
+}
+
+std::string RISCVCodeGenerator::getAsmLabel(int irLabelId) {
+    return irLabels[irLabelId];
+}
+
+// ============================
+// 旧的 AST Visitor 方法 (保留)
+// ============================
 
 bool RISCVCodeGenerator::optimizeConstantFolding(BinaryExpression& node) {
     if (!optimizationsEnabled) return false;
@@ -179,27 +421,6 @@ void RISCVCodeGenerator::visit(BinaryExpression& node) {
     
     emit("sw t0, 0(sp)");
 }
-
-// 添加所有缺失的方法实现
-std::string RISCVCodeGenerator::generate(CompilationUnit& unit, const std::unordered_map<std::string, FunctionInfo>& funcTable) {
-    output.clear();
-    functions = funcTable;
-    stackOffset = 0;
-    labelCounter = 0;
-
-    
-
-    
-    emit(".text");
-    emit(".global main");
-    
-    // 访问编译单元
-    unit.accept(*this);
-    
-    return output;
-}
-
-
 
 void RISCVCodeGenerator::emit(const std::string& instruction) {
     output += instruction + "\n";

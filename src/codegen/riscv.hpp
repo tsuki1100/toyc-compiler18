@@ -1,6 +1,7 @@
 #pragma once
 #include "ast/ast.hpp"
 #include "common/types.hpp"
+#include "ir/ir.hpp"
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -14,29 +15,41 @@ private:
     int stackOffset;
     int labelCounter;
     std::string currentFunction;
-    
+
     // 优化相关
     bool optimizationsEnabled;
-    std::unordered_map<std::string, int> constantValues; // 常量传播
-    
+    std::unordered_map<std::string, int> constantValues;
 
-    
     // 标签栈管理
-    std::stack<std::string> breakLabels;    // break 标签栈
-    std::stack<std::string> continueLabels; // continue 标签栈
-    
+    std::stack<std::string> breakLabels;
+    std::stack<std::string> continueLabels;
+
     // 作用域管理
-    std::stack<std::unordered_map<std::string, int>> scopeStack; // 作用域栈
-    
+    std::stack<std::unordered_map<std::string, int>> scopeStack;
+
+    // IR 代码生成
+    std::unordered_map<int, int> vregSlots;    // vreg → 栈偏移
+    std::unordered_map<int, std::string> irLabels; // IR label id → asm label
+    int vregSlotOffset = 0;
+    int paramIdx = 0; // 函数调用参数计数器
+
+    void generateFunctionFromIR(const IRFunction& irFunc);
+    void emitIRInstruction(const IRInstr& instr);
+
+    // 加载/存储 vreg
+    void loadVRegToT0(int vreg);
+    void loadVRegToT1(int vreg);
+    void storeT0ToVReg(int vreg);
+    std::string getAsmLabel(int irLabelId);
+
 public:
     RISCVCodeGenerator() : stackOffset(0), labelCounter(0), optimizationsEnabled(false) {}
-    
+
     std::string generate(CompilationUnit& unit, const std::unordered_map<std::string, FunctionInfo>& funcTable);
-    
-    // 启用优化
+
     void enableOptimizations() { optimizationsEnabled = true; }
-    
-    // Visitor接口
+
+    // Visitor接口 (保留用于兼容)
     void visit(BinaryExpression& node) override;
     void visit(UnaryExpression& node) override;
     void visit(NumberLiteral& node) override;
@@ -53,23 +66,19 @@ public:
     void visit(ExpressionStatement& node) override;
     void visit(FunctionDefinition& node) override;
     void visit(CompilationUnit& node) override;
-    
+
 private:
     void emit(const std::string& instruction);
     void emitLabel(const std::string& label);
     std::string newLabel(const std::string& prefix = "L");
     void generatePrologue(const std::string& funcName, int localSize);
     void generateEpilogue();
-    
-    // 优化相关方法
+
     bool optimizeConstantFolding(BinaryExpression& node);
     bool evaluateCondition(Expression* expr);
     bool isConstantExpression(Expression* expr);
     int evaluateConstantExpression(Expression* expr);
-    
-    // 栈空间计算
+
     int calculateTotalLocalVariables(Statement* stmt);
     int calculateDynamicStackSpace(int paramCount, int localVarCount);
-    
-
 };
