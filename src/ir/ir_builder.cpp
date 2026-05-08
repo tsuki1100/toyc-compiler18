@@ -163,9 +163,7 @@ void IRBuilder::visit(WhileStatement& node) {
     node.condition->accept(*this);
     // BR cond, body, end
     emit(IROp::BR, -1, IROperand::vreg(resultVReg),
-         IROperand::label(labelBody));
-
-    emit(IROp::JUMP, -1, IROperand::label(labelEnd));
+         IROperand::label(labelEnd));
 
     emit(IROp::LABEL, -1, IROperand::label(labelBody));
     node.body->accept(*this);

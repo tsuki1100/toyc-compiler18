@@ -38,3 +38,4 @@ division operator*//factorial(3)/*}
     * //
     */;
    }/*end of function*/
+// expect: 4

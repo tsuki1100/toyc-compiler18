@@ -1,10 +1,20 @@
 #!/bin/bash
 
-COMPILER=${1:-"./build/compiler"}
+COMPILER=${1:-"./build/toyc"}
 TEST_DIR="test_samples"
 TEMP_DIR="/tmp/toyc_test_$$"
 
-# 颜色输出
+# Auto-detect platform (add .exe on Windows)
+if [[ "$(uname -s)" == *"MINGW"* ]] || [[ "$(uname -s)" == *"MSYS"* ]]; then
+    COMPILER="${COMPILER}.exe"
+fi
+
+# RVSIM is in the same directory as the compiler
+RVSIM="$(dirname "$COMPILER")/rvsim"
+if [[ "$COMPILER" == *.exe ]]; then
+    RVSIM="${RVSIM}.exe"
+fi
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -18,79 +28,104 @@ fi
 
 mkdir -p "$TEMP_DIR"
 
-echo -e "${BLUE}ToyC Compiler Test Suite (stdin/stdout interface)${NC}"
+echo -e "${BLUE}ToyC Compiler Test Suite${NC}"
 echo "=================================================="
 echo "Compiler: $COMPILER"
+echo "Simulator: $RVSIM"
 echo "Test directory: $TEST_DIR"
 echo ""
 
 total_tests=0
 passed_tests=0
 
-# 测试函数
+# Parse expected value from test file
+get_expected() {
+    local test_file=$1
+    sed -n 's/.*\/\/[[:space:]]*expect:[[:space:]]*\(-\?[0-9]\+\).*/\1/p' "$test_file" 2>/dev/null || echo ""
+}
+
 run_test() {
     local test_file=$1
     local test_name=$(basename "$test_file" .tc)
     local use_opt=$2
-    
+
     echo -n "Testing $test_name"
     if [ "$use_opt" = "true" ]; then
         echo -n " (optimized)"
     fi
     echo -n "... "
-    
+
     total_tests=$((total_tests + 1))
-    
-    # 使用stdin/stdout接口测试
+
     local output_file="$TEMP_DIR/$test_name.s"
     local opt_flag=""
     if [ "$use_opt" = "true" ]; then
         opt_flag="-opt"
         output_file="$TEMP_DIR/${test_name}_opt.s"
     fi
-    
-    if "$COMPILER" $opt_flag < "$test_file" > "$output_file" 2>"$TEMP_DIR/$test_name.err"; then
-        if [ -f "$output_file" ] && [ -s "$output_file" ]; then
-            echo -e "${GREEN}PASS${NC}"
-            passed_tests=$((passed_tests + 1))
-            
-            # 显示生成的汇编代码行数
-            local line_count=$(wc -l < "$output_file")
-            echo "  Generated $line_count lines of assembly"
-        else
-            echo -e "${RED}FAIL${NC} (empty output)"
-        fi
-    else
-        echo -e "${RED}FAIL${NC}"
-        if [ -f "$TEMP_DIR/$test_name.err" ]; then
+
+    # Step 1: Compile
+    if ! "$COMPILER" $opt_flag < "$test_file" > "$output_file" 2>"$TEMP_DIR/$test_name.err"; then
+        echo -e "${RED}FAIL${NC} (compilation error)"
+        if [ -f "$TEMP_DIR/$test_name.err" ] && [ -s "$TEMP_DIR/$test_name.err" ]; then
             echo "  Error output:"
             sed 's/^/    /' "$TEMP_DIR/$test_name.err"
         fi
+        return
+    fi
+
+    if [ ! -f "$output_file" ] || [ ! -s "$output_file" ]; then
+        echo -e "${RED}FAIL${NC} (empty output)"
+        return
+    fi
+
+    # Step 2: Check if runtime verification is available
+    local expected=$(get_expected "$test_file")
+    local line_count=$(wc -l < "$output_file")
+
+    if [ -x "$RVSIM" ] && [ -n "$expected" ]; then
+        # Run the generated assembly through the simulator
+        local actual=$("$RVSIM" < "$output_file" 2>/dev/null)
+        if [ "$actual" = "$expected" ]; then
+            echo -e "${GREEN}PASS${NC} (${line_count} asm lines, result: $actual)"
+            passed_tests=$((passed_tests + 1))
+        else
+            echo -e "${RED}FAIL${NC} (expected $expected, got $actual, ${line_count} asm lines)"
+        fi
+    elif [ -x "$RVSIM" ] && [ -z "$expected" ]; then
+        # No expected value annotation; just check compilation
+        echo -e "${GREEN}PASS${NC} (${line_count} asm lines, no runtime check)"
+        passed_tests=$((passed_tests + 1))
+    else
+        # No simulator available
+        echo -e "${GREEN}PASS${NC} (${line_count} asm lines, compilation only)"
+        passed_tests=$((passed_tests + 1))
     fi
 }
 
-# 运行编译测试
-echo "Running compilation tests (normal mode):"
+# Run normal mode tests
+echo "Running compilation + verification tests (normal mode):"
 for test_file in "$TEST_DIR"/*.tc; do
     if [ -f "$test_file" ]; then
         run_test "$test_file" false
     fi
 done
 
+# Run optimized mode tests
 echo ""
-echo "Running compilation tests (optimized mode):"
+echo "Running compilation + verification tests (optimized mode):"
 for test_file in "$TEST_DIR"/*.tc; do
     if [ -f "$test_file" ]; then
         run_test "$test_file" true
     fi
 done
 
-# 测试错误处理
+# Test error handling
 echo ""
 echo "Testing error handling:"
 cat > "$TEMP_DIR/syntax_error.tc" << 'EOF'
 int main() {
-    int x = ;  // 语法错误
+    int x = ;
     return x;
 }
 EOF

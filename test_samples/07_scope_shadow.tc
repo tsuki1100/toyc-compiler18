@@ -4,5 +4,5 @@ int main() {
         int x = 2;
         x = x + 1;
     }
-    return x;
+    return x; // expect: 1
 }

@@ -5,5 +5,5 @@ int main() {
     } else {
         x = x - 1;
     }
-    return x;
+    return x; // expect: 4
 }

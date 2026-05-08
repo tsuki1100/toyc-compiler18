@@ -38,12 +38,10 @@ void RISCVCodeGenerator::generateFunctionFromIR(const IRFunction& irFunc) {
     RegAlloc ra;
     regAlloc = ra.allocate(irFunc);
 
-    // 为溢出 vreg 分配栈槽
+    // 为所有 vreg 分配栈槽 (寄存器分配的也需要槽位，用于跨调用保存)
     for (auto& [vreg, alloc] : regAlloc) {
-        if (alloc.kind == RegAlloc::Allocation::SPILL) {
-            vregSlots[vreg] = vregSlotOffset;
-            vregSlotOffset -= 4;
-        }
+        vregSlots[vreg] = vregSlotOffset;
+        vregSlotOffset -= 4;
     }
 
     // 分配 IR 标签 → 汇编标签
@@ -66,7 +64,7 @@ void RISCVCodeGenerator::generateFunctionFromIR(const IRFunction& irFunc) {
     generatePrologue(irFunc.name, totalFrame);
 
     for (int i = 0; i < irFunc.paramCount && i < 8; i++) {
-        int paramOffset = -20 - i * 4;
+        int paramOffset = -24 - i * 4;
         emit("sw a" + std::to_string(i) + ", " + std::to_string(paramOffset) + "(fp)");
     }
 
@@ -255,8 +253,22 @@ void RISCVCodeGenerator::emitIRInstruction(const IRInstr& instr) {
         break;
     }
 
-    case IROp::CALL:
+    case IROp::CALL: {
+        // 保存所有活跃的 caller-saved 寄存器到栈槽
+        for (auto& [vreg, alloc] : regAlloc) {
+            if (alloc.kind == RegAlloc::Allocation::REG) {
+                std::string r = RegAlloc::REG_NAMES[alloc.physReg];
+                emit("sw " + r + ", " + std::to_string(vregSlots[vreg]) + "(fp)");
+            }
+        }
         emit("call " + instr.src1.name);
+        // 恢复所有活跃的 caller-saved 寄存器
+        for (auto& [vreg, alloc] : regAlloc) {
+            if (alloc.kind == RegAlloc::Allocation::REG) {
+                std::string r = RegAlloc::REG_NAMES[alloc.physReg];
+                emit("lw " + r + ", " + std::to_string(vregSlots[vreg]) + "(fp)");
+            }
+        }
         if (instr.dest.kind == IROperand::VREG) {
             storeResult(instr.dest.value, "a0");
         }
@@ -268,6 +280,7 @@ void RISCVCodeGenerator::emitIRInstruction(const IRInstr& instr) {
         }
         paramIdx = 0;
         break;
+    }
 
     case IROp::RET:
         if (instr.src1.kind == IROperand::VREG && instr.src1.value >= 0) {

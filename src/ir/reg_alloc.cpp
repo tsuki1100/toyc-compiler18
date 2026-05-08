@@ -10,36 +10,21 @@ std::vector<RegAlloc::LiveInterval> RegAlloc::computeLiveIntervals(const IRFunct
     for (size_t i = 0; i < func.instructions.size(); i++) {
         const auto& instr = func.instructions[i];
 
-        auto trackUse = [&](const IROperand& op) {
-            if (op.kind == IROperand::VREG && op.value >= 0) {
-                auto& iv = intervals[op.value];
-                iv.vreg = op.value;
-                if (iv.start == 0 && iv.end == 0 && i > 0) {
-                    // 第一次遇见: 设为起始
-                    iv.start = i;
-                    iv.end = i;
-                } else if (i == 0) {
-                    iv.start = 0;
-                    iv.end = 0;
-                }
-                iv.end = std::max(iv.end, (int)i);
+        auto id = [](int idx) -> int { return idx; };
+
+        auto track = [&](const IROperand& op) {
+            if (op.kind != IROperand::VREG || op.value < 0) return;
+            int v = op.value;
+            if (intervals.find(v) == intervals.end()) {
+                intervals[v] = {(int)v, (int)i, (int)i};
+            } else {
+                intervals[v].end = std::max(intervals[v].end, (int)i);
             }
         };
 
-        auto trackDef = [&](const IROperand& op) {
-            if (op.kind == IROperand::VREG && op.value >= 0) {
-                auto& iv = intervals[op.value];
-                iv.vreg = op.value;
-                if (iv.start == 0 && iv.end == 0 && i > 0) {
-                    iv.start = i;
-                }
-                iv.end = std::max(iv.end, (int)i);
-            }
-        };
-
-        trackDef(instr.dest);
-        trackUse(instr.src1);
-        trackUse(instr.src2);
+        track(instr.dest);
+        track(instr.src1);
+        track(instr.src2);
     }
 
     std::vector<LiveInterval> result;

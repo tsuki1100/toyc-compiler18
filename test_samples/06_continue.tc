@@ -8,5 +8,5 @@ int main() {
         }
         y = y + 1;
     }
-    return y;
+    return y; // expect: 4
 }

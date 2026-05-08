@@ -49,7 +49,10 @@ set_source_files_properties(
 )
 
 
-install(TARGETS compiler toyc
+add_executable(rvsim src/rvsim.cpp)
+target_compile_options(rvsim PRIVATE -Wall -Wextra -O2)
+
+install(TARGETS compiler toyc rvsim
     RUNTIME DESTINATION bin
 )
 

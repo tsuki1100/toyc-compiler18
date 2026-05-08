@@ -7,5 +7,5 @@ int fact(int n) {
 }
 
 int main() {
-    return fact(5);
+    return fact(5); // expect: 120
 }
