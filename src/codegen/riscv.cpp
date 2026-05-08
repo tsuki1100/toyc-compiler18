@@ -4,57 +4,85 @@
 
 // 在RISCVCodeGenerator类中添加这些方法
 
-void RISCVCodeGenerator::optimizeConstantFolding(BinaryExpression& node) {
-    if (!optimizationsEnabled) return;
-    
-    // 检查是否可以进行常量折叠
+bool RISCVCodeGenerator::optimizeConstantFolding(BinaryExpression& node) {
+    if (!optimizationsEnabled) return false;
+
+    // 完全常量折叠：两个操作数都是常量
     if (isConstantExpression(node.left.get()) && isConstantExpression(node.right.get())) {
         int leftVal = evaluateConstantExpression(node.left.get());
         int rightVal = evaluateConstantExpression(node.right.get());
         int result = 0;
-        
+
         switch (node.op) {
             case BinaryExpression::ADD: result = leftVal + rightVal; break;
             case BinaryExpression::SUB: result = leftVal - rightVal; break;
             case BinaryExpression::MUL: result = leftVal * rightVal; break;
-            case BinaryExpression::DIV: 
-                if (rightVal != 0) result = leftVal / rightVal; 
-                else return; // 避免除零
+            case BinaryExpression::DIV:
+                if (rightVal != 0) result = leftVal / rightVal;
+                else return false;
                 break;
-            case BinaryExpression::MOD: 
-                if (rightVal != 0) result = leftVal % rightVal; 
-                else return;
+            case BinaryExpression::MOD:
+                if (rightVal != 0) result = leftVal % rightVal;
+                else return false;
                 break;
-            default: return; // 其他操作不优化
+            default: return false;
         }
-        
-        // 直接加载常量结果
+
         emit("li t0, " + std::to_string(result));
         emit("addi sp, sp, -4");
         emit("sw t0, 0(sp)");
-        return;
+        return true;
     }
-    
-    // 如果不能完全折叠，检查是否有简单优化
+
+    // 代数简化：右操作数为常量
     if (isConstantExpression(node.right.get())) {
         int rightVal = evaluateConstantExpression(node.right.get());
-        
-        // 优化加0、乘1等
+
         if (node.op == BinaryExpression::ADD && rightVal == 0) {
             node.left->accept(*this);
-            return;
+            return true;
+        }
+        if (node.op == BinaryExpression::SUB && rightVal == 0) {
+            node.left->accept(*this);
+            return true;
         }
         if (node.op == BinaryExpression::MUL && rightVal == 1) {
             node.left->accept(*this);
-            return;
+            return true;
         }
         if (node.op == BinaryExpression::MUL && rightVal == 0) {
             emit("li t0, 0");
             emit("addi sp, sp, -4");
             emit("sw t0, 0(sp)");
-            return;
+            return true;
+        }
+        if (node.op == BinaryExpression::DIV && rightVal == 1) {
+            node.left->accept(*this);
+            return true;
         }
     }
+
+    // 代数简化：左操作数为常量
+    if (isConstantExpression(node.left.get())) {
+        int leftVal = evaluateConstantExpression(node.left.get());
+
+        if (node.op == BinaryExpression::ADD && leftVal == 0) {
+            node.right->accept(*this);
+            return true;
+        }
+        if (node.op == BinaryExpression::MUL && leftVal == 0) {
+            emit("li t0, 0");
+            emit("addi sp, sp, -4");
+            emit("sw t0, 0(sp)");
+            return true;
+        }
+        if (node.op == BinaryExpression::MUL && leftVal == 1) {
+            node.right->accept(*this);
+            return true;
+        }
+    }
+
+    return false;
 }
 
 bool RISCVCodeGenerator::isConstantExpression(Expression* expr) {
@@ -89,13 +117,12 @@ int RISCVCodeGenerator::evaluateConstantExpression(Expression* expr) {
 }
 
 void RISCVCodeGenerator::visit(BinaryExpression& node) {
-    // 尝试优化
-    if (optimizationsEnabled) {
-        optimizeConstantFolding(node);
+    // 尝试优化，成功则跳过常规代码生成
+    if (optimizeConstantFolding(node)) {
         return;
     }
-    
-    // 原有的代码生成逻辑
+
+    // 常规代码生成逻辑
     node.left->accept(*this);
     node.right->accept(*this);
     
@@ -163,8 +190,6 @@ std::string RISCVCodeGenerator::generate(CompilationUnit& unit, const std::unord
     
 
     
-    // 生成数据段
-    emit(".data");
     emit(".text");
     emit(".global main");
     
@@ -188,39 +213,33 @@ std::string RISCVCodeGenerator::newLabel(const std::string& prefix) {
     return prefix + std::to_string(labelCounter++);
 }
 
-void RISCVCodeGenerator::generatePrologue(const std::string& funcName, int localSize) {
+void RISCVCodeGenerator::generatePrologue(const std::string& funcName, int frameSize) {
     emitLabel(funcName);
-    // 保存返回地址和帧指针
-    emit("addi sp, sp, -16");  // 分配16字节对齐的栈空间
-    emit("sw ra, 12(sp)");     // 保存返回地址
-    emit("sw fp, 8(sp)");      // 保存帧指针
-    emit("addi fp, sp, 16");   // 设置新的帧指针
-    
-    // 为局部变量分配额外空间
-    if (localSize > 16) {
-        emit("addi sp, sp, -" + std::to_string(localSize - 16));
+    emit("addi sp, sp, -16");
+    emit("sw ra, 12(sp)");
+    emit("sw fp, 8(sp)");
+    emit("addi fp, sp, 16");
+    if (frameSize > 16) {
+        emit("addi sp, sp, -" + std::to_string(frameSize - 16));
     }
 }
 
 void RISCVCodeGenerator::generateEpilogue() {
-    // 恢复帧指针和返回地址
-    // 首先恢复到保存 ra 和 fp 时的 sp 位置
-    emit("addi sp, fp, -16");  // sp = fp - 16，回到保存 ra 和 fp 的位置
-    emit("lw ra, 12(sp)");     // 恢复返回地址
-    emit("lw fp, 8(sp)");      // 恢复帧指针
-    emit("addi sp, sp, 16");   // 恢复栈指针
+    emit("addi sp, fp, -16");
+    emit("lw ra, 12(sp)");
+    emit("lw fp, 8(sp)");
+    emit("addi sp, sp, 16");
     emit("ret");
 }
 
-void RISCVCodeGenerator::optimizeDeadCodeElimination() {
-    // 简单的死代码消除实现
-    for (const auto& code : deadCode) {
-        (void)code; // 避免未使用变量警告
-        // 这里可以实现更复杂的死代码消除逻辑
+bool RISCVCodeGenerator::evaluateCondition(Expression* expr) {
+    if (!expr) return false;
+    if (auto numLit = dynamic_cast<NumberLiteral*>(expr)) {
+        return numLit->value != 0;
     }
+    return false;
 }
 
-// 计算所有作用域中的局部变量数量
 int RISCVCodeGenerator::calculateTotalLocalVariables(Statement* stmt) {
     if (!stmt) return 0;
     
@@ -417,59 +436,68 @@ void RISCVCodeGenerator::visit(Block& node) {
 }
 
 void RISCVCodeGenerator::visit(IfStatement& node) {
+    // 死代码消除：常量条件
+    if (optimizationsEnabled) {
+        if (auto* numLit = dynamic_cast<NumberLiteral*>(node.condition.get())) {
+            if (numLit->value != 0) {
+                node.thenStatement->accept(*this);
+                return;
+            } else if (node.elseStatement) {
+                node.elseStatement->accept(*this);
+                return;
+            } else {
+                return; // if (0) {} → 什么都不生成
+            }
+        }
+    }
+
     std::string elseLabel = newLabel("else");
     std::string endLabel = newLabel("endif");
-    
-    // 计算条件表达式
+
     node.condition->accept(*this);
     emit("lw t0, 0(sp)");
     emit("addi sp, sp, 4");
-    
-    // 条件跳转 - 使用更高效的指令序列
     emit("beqz t0, " + elseLabel);
-    
-    // then 分支
+
     node.thenStatement->accept(*this);
     emit("j " + endLabel);
-    
-    // else 分支
+
     emitLabel(elseLabel);
     if (node.elseStatement) {
         node.elseStatement->accept(*this);
     }
-    
+
     emitLabel(endLabel);
 }
 
 void RISCVCodeGenerator::visit(WhileStatement& node) {
+    // 死代码消除：while (0) { ... }
+    if (optimizationsEnabled) {
+        if (auto* numLit = dynamic_cast<NumberLiteral*>(node.condition.get())) {
+            if (numLit->value == 0) {
+                return; // while (0) 整个循环体被消除
+            }
+        }
+    }
+
     std::string loopLabel = newLabel("loop");
     std::string endLabel = newLabel("endloop");
-    
-    // 压入标签栈，供 break 和 continue 使用
+
     breakLabels.push(endLabel);
     continueLabels.push(loopLabel);
-    
-    // 循环开始标签
+
     emitLabel(loopLabel);
-    
-    // 计算循环条件
+
     node.condition->accept(*this);
     emit("lw t0, 0(sp)");
     emit("addi sp, sp, 4");
-    
-    // 条件为假时跳出循环
     emit("beqz t0, " + endLabel);
-    
-    // 循环体
+
     node.body->accept(*this);
-    
-    // 跳回循环开始
     emit("j " + loopLabel);
-    
-    // 循环结束标签
+
     emitLabel(endLabel);
-    
-    // 弹出标签栈
+
     breakLabels.pop();
     continueLabels.pop();
 }

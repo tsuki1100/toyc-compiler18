@@ -18,7 +18,6 @@ private:
     // 优化相关
     bool optimizationsEnabled;
     std::unordered_map<std::string, int> constantValues; // 常量传播
-    std::vector<std::string> deadCode; // 死代码消除
     
 
     
@@ -63,8 +62,8 @@ private:
     void generateEpilogue();
     
     // 优化相关方法
-    void optimizeConstantFolding(BinaryExpression& node);
-    void optimizeDeadCodeElimination();
+    bool optimizeConstantFolding(BinaryExpression& node);
+    bool evaluateCondition(Expression* expr);
     bool isConstantExpression(Expression* expr);
     int evaluateConstantExpression(Expression* expr);
     
